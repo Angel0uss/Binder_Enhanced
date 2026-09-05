@@ -1,0 +1,12 @@
+## Interface: 30300
+## Title: Binder Enhanced
+## Author: Angelouss
+## Version: 2.1.0
+## Notes: Keybinding manager with Profiles and Sets, General/Character Specific targeting, optional action bar (spells/items/macros/mounts) save, talent-spec auto-apply, macro bank management, and Export/Import + whisper sharing.
+## SavedVariables: Binder_EnhancedDB
+## SavedVariablesPerCharacter: Binder_EnhancedMinimapSettings
+
+Libs\LibStub.lua
+Libs\LibDeflate.lua
+Libs\LibSerialize.lua
+Binder_Enhanced.lua

@@ -15,6 +15,7 @@ Save a full setup — keybinds, action bars, gear, and macros — as a named **S
 - Capture and restore keybindings, either **Character**-specific or **General/account-wide**
 - Confirm/diff popup before applying, so you can see what a Set will change before committing
 - Unbound keybinds in saved sets stay unbound after applying and don't revert to blizzard default values like they used to.
+- Legacy import support for the old "Binder" addon by Tensai.
 
 ### Action Bars
 - Save and restore full action bar layouts, including:

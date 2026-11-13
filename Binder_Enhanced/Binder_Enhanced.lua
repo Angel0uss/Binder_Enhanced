@@ -1,6 +1,6 @@
 Binder_Enhanced = {}
 Binder_Enhanced.Name = "Binder Enhanced"
-Binder_Enhanced.Version = "2.1.0"
+Binder_Enhanced.Version = "2.2.0"
 
 Binder_Enhanced.SendAddonMessage = (C_ChatInfo and C_ChatInfo.SendAddonMessage) or SendAddonMessage
 
@@ -60,7 +60,7 @@ function Binder_Enhanced:InitializeDatabase()
 		Binder_EnhancedDB.Settings.SkipMacros = false
 	end
 	if not Binder_EnhancedDB.Settings.FullMacroBankAction then
-		Binder_EnhancedDB.Settings.FullMacroBankAction = "SKIP"
+		Binder_EnhancedDB.Settings.FullMacroBankAction = "AUTO"
 	end
 	if type(Binder_EnhancedDB.Settings.AutoApplyRestore) ~= "table" then
 		Binder_EnhancedDB.Settings.AutoApplyRestore = { KEYBINDS = true, BARS = true, GEAR = true, MACROS = true }
@@ -554,6 +554,15 @@ local function IsBlankMacroName(name)
 	return not name or name:match("^%s*$") ~= nil
 end
 
+-- Identity of a macro for "is this the same macro" checks: name + exact
+-- body, or body alone for blank names (same rule the matching in
+-- ApplyActionBars uses). Kept on the addon table, not a new top-level
+-- local, to stay clear of Lua's per-chunk local limit.
+function Binder_Enhanced.MacroKey(name, body)
+	if IsBlankMacroName(name) then return "B\1" .. (body or "") end
+	return "N\1" .. name .. "\1" .. (body or "")
+end
+
 local function ApplyActionBars(bars, skipMacros)
 	if type(bars) ~= "table" then return 0, 0, nil end
 
@@ -650,17 +659,31 @@ local function ApplyActionBars(bars, skipMacros)
 	-- whenever the live scan doesn't (yet) show that name, as long as the
 	-- slot we remember hasn't since been reassigned to something else.
 	Binder_Enhanced.KnownMacros = Binder_Enhanced.KnownMacros or {}
+	-- Body companion to KnownMacros above, keyed the same way (by name).
+	-- KnownMacros on its own only remembers WHICH slot we created a macro
+	-- in, not what we put in it -- so when the live scan hasn't synced yet
+	-- (liveBody comes back nil below) there was nothing to fall back on,
+	-- the body-match check a bit further down would then fail against our
+	-- own freshly-created macro, and CreateMacro would fire again on top
+	-- of it. This is what was producing duplicates: invisible in normal
+	-- testing (needs real server lag to trigger), but effectively
+	-- guaranteed on the talent-auto-apply's own 0.75s delayed second pass,
+	-- since that re-enters this function shortly after macros were just
+	-- created in the first pass. KnownBlankMacros never had this problem
+	-- since it's keyed by body already.
+	Binder_Enhanced.KnownMacroBodies = Binder_Enhanced.KnownMacroBodies or {}
 	if GetMacroInfo then
 		for name, knownIdx in pairs(Binder_Enhanced.KnownMacros) do
 			if not IsBlankMacroName(name) and not macroByName[name] then
 				local liveName, _, liveBody = GetMacroInfo(knownIdx)
 				if liveName == nil or liveName == name then
 					macroByName[name] = knownIdx
-					macroBodyByIdx[knownIdx] = liveBody or macroBodyByIdx[knownIdx]
+					macroBodyByIdx[knownIdx] = liveBody or Binder_Enhanced.KnownMacroBodies[name] or macroBodyByIdx[knownIdx]
 				else
 					-- That slot now holds something else -- our record is
 					-- stale (deleted and the id got reused), drop it.
 					Binder_Enhanced.KnownMacros[name] = nil
+					Binder_Enhanced.KnownMacroBodies[name] = nil
 				end
 			end
 		end
@@ -723,8 +746,18 @@ local function ApplyActionBars(bars, skipMacros)
 	local restored, skipped, applyErrors = 0, 0, 0
 	local fullBankMacros = {}
 	local pendingFullBank = {}
+	local pendingFullBankByKey = {}
 	local pendingFreshMacros = {}
-	local fullBankAction = (Binder_EnhancedDB.Settings and Binder_EnhancedDB.Settings.FullMacroBankAction) or "SKIP"
+	-- Every macro THIS set needs (name+body). The replace dialog hides
+	-- these so they can never be offered as something to overwrite.
+	local neededKeys = {}
+	for _, d in pairs(bars) do
+		if type(d) == "table" and d.t == "macro" and d.body then
+			neededKeys[Binder_Enhanced.MacroKey(d.name, d.body)] = true
+		end
+	end
+	pendingFullBank.needed = neededKeys
+	local fullBankAction = (Binder_EnhancedDB.Settings and Binder_EnhancedDB.Settings.FullMacroBankAction) or "AUTO"
 
 	for slot, data in pairs(bars) do
 		local picked = false
@@ -790,9 +823,21 @@ local function ApplyActionBars(bars, skipMacros)
 					-- the popup nor the skip message ever appeared).
 					local iconIdx = (data.icon and iconToIndex[data.icon]) or 1
 					local wantChar = data.per and true or false
-					local createOk, createResult = pcall(CreateMacro, data.name, iconIdx, data.body, wantChar)
-					idx = createOk and createResult or nil
-					if not idx then
+					-- Same macro already waiting on the replace dialog from
+					-- an earlier slot this pass: don't try again and don't
+					-- queue a second prompt -- just remember this slot too,
+					-- so one Replace fills every slot that wanted it.
+					local pendKey = Binder_Enhanced.MacroKey(data.name, data.body) .. (wantChar and "\1C" or "\1G")
+					local alreadyPending = pendingFullBankByKey[pendKey]
+					local createOk, createResult
+					if alreadyPending then
+						table.insert(alreadyPending.slots, slot)
+						bankFull = true
+					else
+						createOk, createResult = pcall(CreateMacro, data.name, iconIdx, data.body, wantChar)
+						idx = createOk and createResult or nil
+					end
+					if not idx and not alreadyPending then
 						if fullBankAction == "PICK" or fullBankAction == "AUTO" then
 							-- Player has opted in to resolving this
 							-- themselves -- queue it instead of just
@@ -801,10 +846,12 @@ local function ApplyActionBars(bars, skipMacros)
 							-- Left unfilled on THIS bar for now; the resolve
 							-- dialog places it once resolved.
 							bankFull = true
-							table.insert(pendingFullBank, {
-								slot = slot, name = data.name, body = data.body,
+							local entry = {
+								slot = slot, slots = { slot }, name = data.name, body = data.body,
 								icon = data.icon, iconIdx = iconIdx, wantChar = wantChar,
-							})
+							}
+							table.insert(pendingFullBank, entry)
+							pendingFullBankByKey[pendKey] = entry
 						else
 							-- Full bank: don't fall back to the stale saved
 							-- id below (it may now belong to a totally
@@ -822,6 +869,7 @@ local function ApplyActionBars(bars, skipMacros)
 						if not IsBlankMacroName(data.name) then
 							macroByName[data.name] = idx
 							Binder_Enhanced.KnownMacros[data.name] = idx
+							Binder_Enhanced.KnownMacroBodies[data.name] = data.body
 						elseif data.body then
 							macroByBlankBody[data.body] = idx
 							Binder_Enhanced.KnownBlankMacros[data.body] = idx
@@ -830,7 +878,10 @@ local function ApplyActionBars(bars, skipMacros)
 					end
 				end
 				if not idx and not bankFull then idx = data.id end
-				if idx and not IsBlankMacroName(data.name) then Binder_Enhanced.KnownMacros[data.name] = idx end
+				if idx and not IsBlankMacroName(data.name) then
+					Binder_Enhanced.KnownMacros[data.name] = idx
+					Binder_Enhanced.KnownMacroBodies[data.name] = data.body
+				end
 				if idx and freshlyCreated then
 					-- Just created server-side this same pass -- PickupMacro
 					-- right now can grab nothing yet (see the round-trip-lag
@@ -2871,7 +2922,7 @@ function Binder_Enhanced:RefreshOptionsTab()
 	BarPromptToggle:SetChecked(barPrompt)
 
 	SkipMacrosToggle:SetChecked(Binder_EnhancedDB.Settings and Binder_EnhancedDB.Settings.SkipMacros and true or false)
-	local fullBankMode = (Binder_EnhancedDB.Settings and Binder_EnhancedDB.Settings.FullMacroBankAction) or "SKIP"
+	local fullBankMode = (Binder_EnhancedDB.Settings and Binder_EnhancedDB.Settings.FullMacroBankAction) or "AUTO"
 	RadioFullSkip:SetChecked(fullBankMode == "SKIP")
 	RadioFullPick:SetChecked(fullBankMode == "PICK")
 	RadioFullAuto:SetChecked(fullBankMode == "AUTO")
@@ -3020,6 +3071,59 @@ local function FullBankSelectRow(idx)
 	end
 end
 
+-- Put a macro on every slot that wanted it.
+local function FullBankPlaceOnSlots(item, macroIdx)
+	for _, s in ipairs(item.slots or { item.slot }) do
+		pcall(function()
+			ClearCursor()
+			PickupMacro(macroIdx)
+			local cursorType = GetCursorInfo and GetCursorInfo()
+			if not GetCursorInfo or cursorType == "macro" then
+				PlaceAction(s)
+			end
+			ClearCursor()
+		end)
+	end
+end
+
+-- Does this exact macro (name+body) already exist in the bank it needs?
+local function FullBankFindExisting(item)
+	local lo, hi = 1, 36
+	if item.wantChar then lo, hi = 37, 54 end
+	local want = Binder_Enhanced.MacroKey(item.name, item.body)
+	for i = lo, hi do
+		local mName, _, mBody = GetMacroInfo(i)
+		if mName and Binder_Enhanced.MacroKey(mName, mBody) == want then return i end
+	end
+end
+
+-- Macro indexes currently sitting on an action bar slot.
+local function FullBankMacrosOnBars()
+	local on = {}
+	for s = 1, ACTIONBAR_SLOT_MAX do
+		local ok, actionType, id = pcall(GetActionInfo, s)
+		if ok and actionType == "macro" and id then on[id] = true end
+	end
+	return on
+end
+
+-- Name+body keys of every macro stored in ANY saved set.
+local function FullBankMacrosInSavedSets()
+	local used = {}
+	for _, profile in pairs(Binder_EnhancedDB.Profiles or {}) do
+		for _, set in pairs(profile.Sets or {}) do
+			if type(set.ActionBars) == "table" then
+				for _, d in pairs(set.ActionBars) do
+					if type(d) == "table" and d.t == "macro" and d.body then
+						used[Binder_Enhanced.MacroKey(d.name, d.body)] = true
+					end
+				end
+			end
+		end
+	end
+	return used
+end
+
 local function FullBankGetRow(i)
 	local row = FullBankFrame.rows[i]
 	if not row then
@@ -3039,6 +3143,21 @@ end
 
 local function FullBankShowCurrent()
 	local item = FullBankFrame.queue[FullBankFrame.queueIndex]
+	-- Stale prompt check: if this exact macro is already in the bank by
+	-- now, there's nothing to replace -- place it and move on.
+	while item do
+		local existing = FullBankFindExisting(item)
+		if not existing then break end
+		if not IsBlankMacroName(item.name) then
+			Binder_Enhanced.KnownMacros[item.name] = existing
+			Binder_Enhanced.KnownMacroBodies[item.name] = item.body
+		elseif item.body then
+			Binder_Enhanced.KnownBlankMacros[item.body] = existing
+		end
+		FullBankPlaceOnSlots(item, existing)
+		FullBankFrame.queueIndex = FullBankFrame.queueIndex + 1
+		item = FullBankFrame.queue[FullBankFrame.queueIndex]
+	end
 	if not item then
 		FullBankFrame:Hide()
 		return
@@ -3055,10 +3174,24 @@ local function FullBankShowCurrent()
 	local lo, hi = 1, 36
 	if item.wantChar then lo, hi = 37, 54 end
 	local n = 0
+	local needed = FullBankFrame.queue.needed or {}
+	local onBars = FullBankMacrosOnBars()
+	local inSets = FullBankMacrosInSavedSets()
+	local bestIdx, bestInSet
 	for i = lo, hi do
 		local mName, mIcon, mBody = GetMacroInfo(i)
-		if mName then
+		local mKey = mName and Binder_Enhanced.MacroKey(mName, mBody)
+		-- Macros this set needs are never offered for replacement.
+		if mName and not needed[mKey] then
 			n = n + 1
+			-- Auto candidate: off every bar, preferring ones no saved
+			-- set uses either; ties go to the lowest slot (loop order).
+			if not onBars[i] then
+				local inSet = inSets[mKey] and true or false
+				if bestIdx == nil or (bestInSet and not inSet) then
+					bestIdx, bestInSet = i, inSet
+				end
+			end
 			local row = FullBankGetRow(n)
 			row.macroIdx = i
 			if not IsBlankMacroName(mName) then
@@ -3082,12 +3215,21 @@ local function FullBankShowCurrent()
 	for i = n + 1, #FullBankFrame.rows do FullBankFrame.rows[i]:Hide() end
 	FullBankContent:SetHeight(math.max(190, n * 20))
 
-	local mode = (Binder_EnhancedDB.Settings and Binder_EnhancedDB.Settings.FullMacroBankAction) or "SKIP"
-	if mode == "AUTO" and n > 0 then
-		-- Pre-select a candidate -- the first (lowest-index) macro in that
-		-- bank -- but the player can still click a different row instead.
-		FullBankSelectRow(FullBankFrame.rows[1].macroIdx)
+	local mode = (Binder_EnhancedDB.Settings and Binder_EnhancedDB.Settings.FullMacroBankAction) or "AUTO"
+	local hint = "Pick a macro below to overwrite with the new one, or Skip."
+	if n == 0 then
+		hint = "Every macro in this bank is used by this set. Free up a slot manually, then Skip."
+	elseif mode == "AUTO" then
+		if bestIdx then
+			-- Pre-select the safest candidate; the player can still click
+			-- a different row, and nothing is replaced until Replace.
+			FullBankSelectRow(bestIdx)
+			hint = "Auto-picked a macro that is on no bar. Click Replace to confirm, or choose another."
+		else
+			hint = "No macro in this bank is free of your bars -- choose one yourself, or Skip."
+		end
 	end
+	FullBankHint:SetText(hint)
 
 	FullBankFrame:Show()
 end
@@ -3109,14 +3251,17 @@ FullBankReplaceBtn:SetScript("OnClick", function()
 	if item and chosenIdx and EditMacro then
 		local ok = pcall(function()
 			EditMacro(chosenIdx, item.name, item.iconIdx, item.body)
-			Binder_Enhanced.KnownMacros[item.name] = chosenIdx
-			ClearCursor()
-			PickupMacro(chosenIdx)
-			local cursorType = GetCursorInfo and GetCursorInfo()
-			if not GetCursorInfo or cursorType == "macro" then
-				PlaceAction(item.slot)
+			if not IsBlankMacroName(item.name) then
+				Binder_Enhanced.KnownMacros[item.name] = chosenIdx
+				Binder_Enhanced.KnownMacroBodies[item.name] = item.body
+			elseif item.body then
+				-- Was previously written into KnownMacros keyed by a blank
+				-- name -- wrong table for a blank-named macro (collides
+				-- with every other blank name); route it to the
+				-- body-keyed cache instead, same as everywhere else.
+				Binder_Enhanced.KnownBlankMacros[item.body] = chosenIdx
 			end
-			ClearCursor()
+			FullBankPlaceOnSlots(item, chosenIdx)
 		end)
 		if not ok then Msg("Couldn't replace that macro -- see /console scriptErrors 1 for details.") end
 	end

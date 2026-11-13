@@ -2,7 +2,7 @@
 ## Title: Binder Enhanced
 ## Author: Angel0uss
 ## github: https://github.com/Angel0uss/Binder_Enhanced
-## Version: 2.1.0
+## Version: 2.2.0
 ## Notes: Keybinding manager with Profiles and Sets, General/Character Specific targeting, optional action bar (spells/items/macros/mounts) save, talent-spec auto-apply, macro bank management, and Export/Import + whisper sharing.
 ## SavedVariables: Binder_EnhancedDB
 ## SavedVariablesPerCharacter: Binder_EnhancedMinimapSettings
